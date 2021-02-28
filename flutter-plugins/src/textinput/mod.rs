@@ -2,24 +2,45 @@
 //! It handles flutter/textinput type message.
 
 use log::debug;
+use std::sync::{Arc, RwLock, Weak};
 
-use super::prelude::*;
+use serde::{Deserialize, Serialize};
+
+use flutter_engine::codec::value::VecExt;
+
+use flutter_engine::{
+    channel::{MethodCallHandler, MethodChannel},
+    codec::JSON_CODEC,
+    plugins::Plugin,
+    FlutterEngine,
+};
 
 use self::text_editing_state::TextEditingState;
+use flutter_engine::channel::MethodCall;
+use flutter_engine::codec::Value;
+use parking_lot::Mutex;
 
 mod text_editing_state;
+pub(crate) mod utils;
 
 pub const PLUGIN_NAME: &str = module_path!();
 pub const CHANNEL_NAME: &str = "flutter/textinput";
 
+pub trait TextInputHandler {
+    fn show(&mut self);
+
+    fn hide(&mut self);
+}
+
 pub struct TextInputPlugin {
-    channel: Weak<JsonMethodChannel>,
-    handler: Arc<RwLock<Handler>>,
+    channel: Weak<MethodChannel>,
     data: Arc<RwLock<Data>>,
+    handler: Arc<Mutex<dyn TextInputHandler + Send>>,
 }
 
 struct Handler {
     data: Arc<RwLock<Data>>,
+    handler: Arc<Mutex<dyn TextInputHandler + Send>>,
 }
 
 struct Data {
@@ -32,33 +53,34 @@ impl Plugin for TextInputPlugin {
         PLUGIN_NAME
     }
 
-    fn init_channels(&mut self, registrar: &mut ChannelRegistrar) {
-        let method_handler = Arc::downgrade(&self.handler);
-        self.channel =
-            registrar.register_channel(JsonMethodChannel::new(CHANNEL_NAME, method_handler));
+    fn init(&mut self, engine: &FlutterEngine) {
+        self.channel = engine.register_channel(MethodChannel::new(
+            CHANNEL_NAME,
+            Handler {
+                data: self.data.clone(),
+                handler: self.handler.clone(),
+            },
+            &JSON_CODEC,
+        ));
     }
 }
 
-impl Default for TextInputPlugin {
-    fn default() -> Self {
+impl TextInputPlugin {
+    pub fn new(handler: Arc<Mutex<dyn TextInputHandler + Send>>) -> Self {
         let data = Arc::new(RwLock::new(Data {
             client_id: None,
             editing_state: None,
         }));
         Self {
             channel: Weak::new(),
-            handler: Arc::new(RwLock::new(Handler {
-                data: Arc::clone(&data),
-            })),
+            handler,
             data,
         }
     }
-}
 
-impl TextInputPlugin {
     fn with_channel<F>(&self, f: F)
     where
-        F: FnOnce(&dyn MethodChannel),
+        F: FnOnce(&MethodChannel),
     {
         if let Some(channel) = self.channel.upgrade() {
             f(&*channel);
@@ -75,10 +97,10 @@ impl TextInputPlugin {
     pub fn perform_action(&self, action: &str) {
         let data = self.data.read().unwrap();
         self.with_channel(|channel| {
-            channel.invoke_method(MethodCall {
-                method: String::from("TextInputClient.performAction"),
-                args: json_value!([data.client_id, "TextInputAction.".to_owned() + action]),
-            })
+            let mut args: Vec<Value> = Vec::new();
+            args.push_as_value(data.client_id);
+            args.push_as_value("TextInputAction.".to_owned() + action);
+            channel.invoke_method("TextInputClient.performAction", args)
         });
     }
 
@@ -87,44 +109,50 @@ impl TextInputPlugin {
         let client_id = data.client_id;
         if let Some(state) = &mut (data.editing_state) {
             if let Some(channel) = self.channel.upgrade() {
-                channel.invoke_method(MethodCall {
-                    method: String::from("TextInputClient.updateEditingState"),
-                    args: json_value!([client_id, state]),
-                });
+                let mut args: Vec<Value> = Vec::new();
+                args.push_as_value(client_id);
+                args.push_as_value(state);
+                channel.invoke_method("TextInputClient.updateEditingState", args)
             }
         };
     }
 }
 
 impl MethodCallHandler for Handler {
-    fn on_method_call(
-        &mut self,
-        call: MethodCall,
-        _: FlutterEngine,
-    ) -> Result<Value, MethodCallError> {
-        debug!("got method call {} with args {:?}", call.method, call.args);
-        match call.method.as_str() {
+    fn on_method_call(&mut self, call: MethodCall) {
+        debug!(
+            "got method call {} with args {:?}",
+            call.method(),
+            call.raw_args()
+        );
+        match call.method().as_str() {
             "TextInput.setClient" => {
                 let mut data = self.data.write().unwrap();
-                let args: SetClientArgs = from_value(&call.args)?;
+                let args: SetClientArgs = call.args();
                 data.client_id = Some(args.0);
-                Ok(Value::Null)
+                call.success_empty()
             }
             "TextInput.clearClient" => {
                 let mut data = self.data.write().unwrap();
                 data.client_id = None;
                 data.editing_state.take();
-                Ok(Value::Null)
+                call.success_empty()
             }
             "TextInput.setEditingState" => {
                 let mut data = self.data.write().unwrap();
-                let state: TextEditingState = from_value(&call.args)?;
+                let state: TextEditingState = call.args();
                 data.editing_state.replace(state);
-                Ok(Value::Null)
+                call.success_empty()
             }
-            "TextInput.show" => Ok(Value::Null),
-            "TextInput.hide" => Ok(Value::Null),
-            _ => Err(MethodCallError::NotImplemented),
+            "TextInput.show" => {
+                self.handler.lock().show();
+                call.success_empty()
+            }
+            "TextInput.hide" => {
+                self.handler.lock().hide();
+                call.success_empty()
+            }
+            _ => call.not_implemented(),
         }
     }
 }

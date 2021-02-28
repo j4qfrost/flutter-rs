@@ -1,11 +1,15 @@
 use crate::context::Context;
-use crate::handler::{WinitFlutterEngineHandler, WinitPlatformHandler, WinitWindowHandler};
+use crate::handler::{
+    WinitOpenGLHandler, WinitPlatformHandler, WinitPlatformTaskHandler, WinitTextInputHandler,
+    WinitWindowHandler,
+};
 use crate::keyboard::raw_key;
 use crate::pointer::Pointers;
+use flutter_engine::builder::FlutterEngineBuilder;
 use flutter_engine::channel::Channel;
 use flutter_engine::plugins::Plugin;
 use flutter_engine::texture_registry::Texture;
-use flutter_engine::{FlutterEngine, FlutterEngineHandler};
+use flutter_engine::FlutterEngine;
 use flutter_plugins::dialog::DialogPlugin;
 use flutter_plugins::isolate::IsolatePlugin;
 use flutter_plugins::keyevent::{KeyAction, KeyActionType, KeyEventPlugin};
@@ -39,12 +43,15 @@ pub struct FlutterWindow {
     context: Arc<Mutex<Context>>,
     resource_context: Arc<Mutex<Context>>,
     engine: FlutterEngine,
-    engine_handler: Arc<WinitFlutterEngineHandler>,
     close: Arc<AtomicBool>,
 }
 
 impl FlutterWindow {
-    pub fn new(window: WindowBuilder, assets_path: PathBuf) -> Result<Self, Box<dyn Error>> {
+    pub fn new(
+        window: WindowBuilder,
+        assets_path: PathBuf,
+        arguments: Vec<String>,
+    ) -> Result<Self, Box<dyn Error>> {
         let event_loop = EventLoop::with_user_event();
         let proxy = event_loop.create_proxy();
 
@@ -52,25 +59,29 @@ impl FlutterWindow {
         let context = Arc::new(Mutex::new(Context::from_context(context)));
         let resource_context = Arc::new(Mutex::new(Context::empty()));
 
-        let engine_handler = Arc::new(WinitFlutterEngineHandler::new(
-            proxy,
-            context.clone(),
-            resource_context.clone(),
-        ));
-        let engine = FlutterEngine::new(Arc::downgrade(&engine_handler) as _, assets_path);
+        let platform_task_handler = Arc::new(WinitPlatformTaskHandler::new(proxy));
+
+        let opengl_handler = WinitOpenGLHandler::new(context.clone(), resource_context.clone());
+
+        let engine = FlutterEngineBuilder::new()
+            .with_platform_handler(platform_task_handler)
+            .with_opengl(opengl_handler)
+            .with_asset_path(assets_path)
+            .with_args(arguments)
+            .build()
+            .expect("Failed to create engine");
 
         let proxy = event_loop.create_proxy();
         let isolate_cb = move || {
             proxy.send_event(FlutterEvent::IsolateCreated).ok();
         };
-        let platform_handler = Arc::new(Mutex::new(Box::new(WinitPlatformHandler::new(
-            context.clone(),
-        )?) as _));
+        let platform_handler = Arc::new(Mutex::new(WinitPlatformHandler::new(context.clone())?));
         let close = Arc::new(AtomicBool::new(false));
         let window_handler = Arc::new(Mutex::new(WinitWindowHandler::new(
             context.clone(),
             close.clone(),
         )));
+        let textinput_handler = Arc::new(Mutex::new(WinitTextInputHandler::default()));
 
         engine.add_plugin(DialogPlugin::default());
         engine.add_plugin(IsolatePlugin::new(isolate_cb));
@@ -81,7 +92,7 @@ impl FlutterWindow {
         engine.add_plugin(PlatformPlugin::new(platform_handler));
         engine.add_plugin(SettingsPlugin::default());
         engine.add_plugin(SystemPlugin::default());
-        engine.add_plugin(TextInputPlugin::default());
+        engine.add_plugin(TextInputPlugin::new(textinput_handler));
         engine.add_plugin(WindowPlugin::new(window_handler));
 
         Ok(Self {
@@ -89,7 +100,6 @@ impl FlutterWindow {
             context,
             resource_context,
             engine,
-            engine_handler,
             close,
         })
     }
@@ -163,9 +173,8 @@ impl FlutterWindow {
         self.engine.with_channel(channel_name, f)
     }
 
-    pub fn start_engine(&self, arguments: &[String]) -> Result<(), Box<dyn Error>> {
-        self.engine.run(arguments)?;
-        Ok(())
+    pub fn start_engine(&self) -> Result<(), ()> {
+        self.engine.run()
     }
 
     pub fn run(self) -> ! {
@@ -329,10 +338,6 @@ impl FlutterWindow {
                     }
                 }
             });
-    }
-
-    pub fn wake_platform_thread(&self) {
-        self.engine_handler.wake_platform_thread();
     }
 }
 

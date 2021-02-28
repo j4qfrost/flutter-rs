@@ -1,6 +1,4 @@
-#[macro_use]
-mod macros;
-
+pub mod builder;
 pub mod channel;
 pub mod codec;
 pub mod error;
@@ -8,50 +6,52 @@ pub mod ffi;
 mod flutter_callbacks;
 pub mod plugins;
 pub mod tasks;
-pub mod texture_registry;
-pub mod utils;
 
-use crate::channel::{Channel, ChannelRegistrar};
+use futures_task::FutureObj;
+
+pub mod texture_registry;
+
+use crate::builder::FlutterEngineBuilder;
+use crate::channel::{Channel, ChannelRegistry};
 use crate::ffi::{
     FlutterPointerDeviceKind, FlutterPointerMouseButtons, FlutterPointerPhase,
-    FlutterPointerSignalKind, PlatformMessage, PlatformMessageResponseHandle,
+    FlutterPointerSignalKind,
 };
-use crate::plugins::{Plugin, PluginRegistrar};
-use crate::tasks::{TaskRunner, TaskRunnerHandler};
+
+use crate::channel::platform_message::{PlatformMessage, PlatformMessageResponseHandle};
+use crate::tasks::TaskRunner;
 use crate::texture_registry::{Texture, TextureRegistry};
+use async_std::task;
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use flutter_engine_sys::FlutterTask;
+use flutter_engine_sys::{FlutterEngineResult, FlutterTask};
 use log::trace;
 use parking_lot::RwLock;
 use std::ffi::CString;
 use std::future::Future;
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{mem, ptr};
 
 pub(crate) type MainThreadEngineFn = Box<dyn FnOnce(&FlutterEngine) + Send>;
-pub(crate) type MainThreadChannelFn = (String, Box<dyn FnMut(&dyn Channel) + Send>);
 pub(crate) type MainThreadRenderThreadFn = Box<dyn FnOnce(&FlutterEngine) + Send>;
 
 pub(crate) enum MainThreadCallback {
     Engine(MainThreadEngineFn),
-    Channel(MainThreadChannelFn),
     RenderThread(MainThreadRenderThreadFn),
 }
 
 struct FlutterEngineInner {
-    handler: Weak<dyn FlutterEngineHandler>,
-    engine_ptr: AtomicPtr<flutter_engine_sys::_FlutterEngine>,
-    plugins: RwLock<PluginRegistrar>,
+    opengl_handler: Box<dyn FlutterOpenGLHandler + Send>,
+    engine_ptr: flutter_engine_sys::FlutterEngine,
+    channel_registry: RwLock<ChannelRegistry>,
     platform_runner: TaskRunner,
-    _platform_runner_handler: Arc<PlatformRunnerHandler>,
     platform_receiver: Receiver<MainThreadCallback>,
     platform_sender: Sender<MainThreadCallback>,
     texture_registry: TextureRegistry,
     assets: PathBuf,
+    arguments: Vec<String>,
 }
 
 pub struct FlutterEngineWeakRef {
@@ -63,11 +63,19 @@ unsafe impl Send for FlutterEngineWeakRef {}
 unsafe impl Sync for FlutterEngineWeakRef {}
 
 impl FlutterEngineWeakRef {
-    fn upgrade(&self) -> Option<FlutterEngine> {
+    pub fn upgrade(&self) -> Option<FlutterEngine> {
         match self.inner.upgrade() {
             None => None,
             Some(arc) => Some(FlutterEngine { inner: arc }),
         }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.upgrade().is_some()
+    }
+
+    pub fn ptr_equal(&self, other: Self) -> bool {
+        self.inner.ptr_eq(&other.inner)
     }
 }
 
@@ -101,7 +109,7 @@ impl Clone for FlutterEngine {
     }
 }
 
-pub trait FlutterEngineHandler {
+pub trait FlutterOpenGLHandler {
     fn swap_buffers(&self) -> bool;
 
     fn make_current(&self) -> bool;
@@ -113,140 +121,47 @@ pub trait FlutterEngineHandler {
     fn make_resource_current(&self) -> bool;
 
     fn gl_proc_resolver(&self, proc: *const c_char) -> *mut c_void;
-
-    fn wake_platform_thread(&self);
-
-    fn run_in_background(&self, func: Box<dyn Future<Output = ()> + Send + 'static>);
-}
-
-struct PlatformRunnerHandler {
-    handler: Weak<dyn FlutterEngineHandler>,
-}
-
-impl TaskRunnerHandler for PlatformRunnerHandler {
-    fn wake(&self) {
-        if let Some(handler) = self.handler.upgrade() {
-            handler.wake_platform_thread();
-        }
-    }
 }
 
 impl FlutterEngine {
-    pub fn new(handler: Weak<dyn FlutterEngineHandler>, assets: PathBuf) -> Self {
-        let platform_handler = Arc::new(PlatformRunnerHandler {
-            handler: handler.clone(),
-        });
-
-        let (main_tx, main_rx) = unbounded();
-
-        let engine = Self {
-            inner: Arc::new(FlutterEngineInner {
-                handler,
-                engine_ptr: AtomicPtr::new(ptr::null_mut()),
-                plugins: RwLock::new(PluginRegistrar::new()),
-                platform_runner: TaskRunner::new(
-                    Arc::downgrade(&platform_handler) as Weak<dyn TaskRunnerHandler>
-                ),
-                _platform_runner_handler: platform_handler,
-                platform_receiver: main_rx,
-                platform_sender: main_tx,
-                texture_registry: TextureRegistry::new(),
-                assets,
-            }),
-        };
-
-        let inner = &engine.inner;
-        inner.plugins.write().init(engine.downgrade());
-        inner.platform_runner.init(engine.downgrade());
-
-        engine
-    }
-
-    #[inline]
-    pub fn engine_ptr(&self) -> flutter_engine_sys::FlutterEngine {
-        self.inner.engine_ptr.load(Ordering::Relaxed)
-    }
-
-    pub fn add_plugin<P>(&self, plugin: P) -> &Self
-    where
-        P: Plugin + 'static,
-    {
-        self.inner.plugins.write().add_plugin(plugin);
-        self
-    }
-
-    pub fn with_plugin<F, P>(&self, f: F)
-    where
-        F: FnOnce(&P),
-        P: Plugin + 'static,
-    {
-        self.inner.plugins.read().with_plugin(f)
-    }
-
-    pub fn with_plugin_mut<F, P>(&self, f: F)
-    where
-        F: FnOnce(&mut P),
-        P: Plugin + 'static,
-    {
-        self.inner.plugins.write().with_plugin_mut(f)
-    }
-
-    pub fn remove_channel(&self, channel_name: &str) -> Option<Arc<dyn Channel>> {
-        self.inner
-            .plugins
-            .write()
-            .channel_registry
-            .remove_channel(channel_name)
-    }
-
-    pub fn with_channel<F>(&self, channel_name: &str, f: F)
-    where
-        F: FnOnce(&dyn Channel),
-    {
-        self.inner
-            .plugins
-            .read()
-            .channel_registry
-            .with_channel(channel_name, f)
-    }
-
-    pub fn with_channel_registrar<F>(&self, plugin_name: &'static str, f: F)
-    where
-        F: FnOnce(&mut ChannelRegistrar),
-    {
-        self.inner
-            .plugins
-            .write()
-            .channel_registry
-            .with_channel_registrar(plugin_name, f)
-    }
-
-    pub fn downgrade(&self) -> FlutterEngineWeakRef {
-        FlutterEngineWeakRef {
-            inner: Arc::downgrade(&self.inner),
-        }
-    }
-
-    pub fn assets(&self) -> &Path {
-        &self.inner.assets
-    }
-
-    pub fn run(&self, arguments: &[String]) -> Result<(), RunError> {
-        if !self.is_platform_thread() {
-            return Err(RunError::NotPlatformThread);
-        }
-
-        let mut args = Vec::with_capacity(arguments.len() + 2);
+    pub(crate) fn new(builder: FlutterEngineBuilder) -> Result<Self, CreateError> {
+        // Convert arguments into flutter compatible
+        let mut args = Vec::with_capacity(builder.args.len() + 2);
         args.push(CString::new("flutter-rs").unwrap().into_raw());
         args.push(
             CString::new("--icu-symbol-prefix=gIcudtl")
                 .unwrap()
                 .into_raw(),
         );
-        for arg in arguments.iter() {
+        for arg in builder.args.iter() {
             args.push(CString::new(arg.as_str()).unwrap().into_raw());
         }
 
+        let (main_tx, main_rx) = unbounded();
+
+        let engine = Self {
+            inner: Arc::new(FlutterEngineInner {
+                opengl_handler: builder
+                    .opengl_handler
+                    .expect("Only opengl is supported (for now)"),
+                engine_ptr: ptr::null_mut(),
+                channel_registry: RwLock::new(ChannelRegistry::new()),
+                platform_runner: TaskRunner::new(
+                    builder.platform_handler.expect("No platform runner set"),
+                ),
+                platform_receiver: main_rx,
+                platform_sender: main_tx,
+                texture_registry: TextureRegistry::new(),
+                assets: builder.assets,
+                arguments: builder.args,
+            }),
+        };
+
+        let inner = &engine.inner;
+        inner.channel_registry.write().init(engine.downgrade());
+        inner.platform_runner.init(engine.downgrade());
+
+        // Configure renderer
         let renderer_config = flutter_engine_sys::FlutterRendererConfig {
             type_: flutter_engine_sys::FlutterRendererType::kOpenGL,
             __bindgen_anon_1: flutter_engine_sys::FlutterRendererConfig__bindgen_ty_1 {
@@ -268,9 +183,10 @@ impl FlutterEngine {
             },
         };
 
+        // Configure engine threads
         // TODO: Should be downgraded to a weak once weak::into_raw lands in stable
         let runner_ptr = {
-            let arc = self.inner.platform_runner.clone().inner;
+            let arc = inner.platform_runner.clone().inner;
             Arc::into_raw(arc) as *mut std::ffi::c_void
         };
 
@@ -287,13 +203,13 @@ impl FlutterEngine {
             struct_size: std::mem::size_of::<flutter_engine_sys::FlutterCustomTaskRunners>(),
             platform_task_runner: &platform_task_runner
                 as *const flutter_engine_sys::FlutterTaskRunnerDescription,
-            render_task_runner: &platform_task_runner
-                as *const flutter_engine_sys::FlutterTaskRunnerDescription,
+            render_task_runner: std::ptr::null(),
         };
 
+        // Configure engine
         let project_args = flutter_engine_sys::FlutterProjectArgs {
             struct_size: std::mem::size_of::<flutter_engine_sys::FlutterProjectArgs>(),
-            assets_path: path_to_cstring(self.assets()).into_raw(),
+            assets_path: path_to_cstring(&inner.assets).into_raw(),
             main_path__unused__: std::ptr::null(),
             packages_path__unused__: std::ptr::null(),
             icu_data_path: std::ptr::null(),
@@ -321,25 +237,84 @@ impl FlutterEngine {
             compositor: std::ptr::null(),
         };
 
+        // Initialise engine
         unsafe {
             // TODO: Should be downgraded to a weak once weak::into_raw lands in stable
-            let inner_ptr = Arc::into_raw(self.inner.clone()) as *mut std::ffi::c_void;
+            let inner_ptr = Arc::into_raw(inner.clone()) as *mut std::ffi::c_void;
 
-            let engine_ptr: flutter_engine_sys::FlutterEngine = std::ptr::null_mut();
-            if flutter_engine_sys::FlutterEngineRun(
+            if flutter_engine_sys::FlutterEngineInitialize(
                 1,
                 &renderer_config,
                 &project_args,
                 inner_ptr,
-                &engine_ptr as *const flutter_engine_sys::FlutterEngine
+                &inner.engine_ptr as *const flutter_engine_sys::FlutterEngine
                     as *mut flutter_engine_sys::FlutterEngine,
             ) != flutter_engine_sys::FlutterEngineResult::kSuccess
-                || engine_ptr.is_null()
+                || inner.engine_ptr.is_null()
             {
-                Err(RunError::EnginePtrNull)
+                Err(CreateError::EnginePtrNull)
             } else {
-                self.inner.engine_ptr.store(engine_ptr, Ordering::Relaxed);
-                Ok(())
+                Ok(engine)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn engine_ptr(&self) -> flutter_engine_sys::FlutterEngine {
+        self.inner.engine_ptr
+    }
+
+    pub fn register_channel<C>(&self, channel: C) -> Weak<C>
+    where
+        C: Channel + 'static,
+    {
+        self.inner
+            .channel_registry
+            .write()
+            .register_channel(channel)
+    }
+
+    pub fn remove_channel(&self, channel_name: &str) -> Option<Arc<dyn Channel>> {
+        self.inner
+            .channel_registry
+            .write()
+            .remove_channel(channel_name)
+    }
+
+    pub fn with_channel<F>(&self, channel_name: &str, f: F)
+    where
+        F: FnOnce(&dyn Channel),
+    {
+        self.inner
+            .channel_registry
+            .read()
+            .with_channel(channel_name, f)
+    }
+
+    pub fn downgrade(&self) -> FlutterEngineWeakRef {
+        FlutterEngineWeakRef {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
+    pub fn assets(&self) -> &Path {
+        &self.inner.assets
+    }
+
+    pub fn arguments(&self) -> &Vec<String> {
+        &self.inner.arguments
+    }
+
+    pub fn run(&self) -> Result<(), ()> {
+        if !self.is_platform_thread() {
+            panic!("Not on platform thread");
+        }
+
+        // TODO: Safeguard, process results
+        unsafe {
+            match flutter_engine_sys::FlutterEngineRunInitialized(self.engine_ptr()) {
+                FlutterEngineResult::kSuccess => Ok(()),
+                _ => Err(()),
             }
         }
     }
@@ -369,17 +344,17 @@ impl FlutterEngine {
     where
         F: FnOnce(&FlutterEngine) -> () + 'static + Send,
     {
-        if self.is_platform_thread() {
-            f(self);
-        } else {
-            self.post_platform_callback(MainThreadCallback::RenderThread(Box::new(f)));
-        }
+        // TODO: Reimplement render thread
+        // if self.is_platform_thread() {
+        //     f(self);
+        // } else {
+        self.post_platform_callback(MainThreadCallback::RenderThread(Box::new(f)));
+        // }
     }
 
+    #[deprecated(note = "Soon to be removed: Unclear use cases")]
     pub fn run_in_background(&self, future: impl Future<Output = ()> + Send + 'static) {
-        if let Some(handler) = self.inner.handler.upgrade() {
-            handler.run_in_background(Box::new(future));
-        }
+        task::spawn(FutureObj::new(Box::new(future)));
     }
 
     pub fn send_window_metrics_event(&self, width: usize, height: usize, pixel_ratio: f64) {
@@ -495,15 +470,6 @@ impl FlutterEngine {
         for cb in callbacks {
             match cb {
                 MainThreadCallback::Engine(func) => func(self),
-                MainThreadCallback::Channel((name, mut f)) => {
-                    self.inner
-                        .plugins
-                        .write()
-                        .channel_registry
-                        .with_channel(&name, |channel| {
-                            f(channel);
-                        });
-                }
                 MainThreadCallback::RenderThread(f) => render_thread_fns.push(f),
             }
         }
@@ -568,19 +534,19 @@ fn path_to_cstring(path: &Path) -> CString {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum RunError {
-    NotPlatformThread,
+pub enum CreateError {
+    NoHandler,
     EnginePtrNull,
 }
 
-impl core::fmt::Display for RunError {
+impl core::fmt::Display for CreateError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         let msg = match self {
-            RunError::NotPlatformThread => "Not on platform thread.",
-            RunError::EnginePtrNull => "Engine ptr is null.",
+            CreateError::NoHandler => "No handler set.",
+            CreateError::EnginePtrNull => "Engine ptr is null.",
         };
         writeln!(f, "{}", msg)
     }
 }
 
-impl std::error::Error for RunError {}
+impl std::error::Error for CreateError {}
